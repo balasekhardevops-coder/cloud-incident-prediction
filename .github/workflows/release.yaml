@@ -59,13 +59,13 @@ jobs:
 
           train = get(f"/actions/runs/{run_id}")
           if not all([
-              ".github/workflows/train.yml" in train.get("path", ""),
+              ".github/workflows/train.yaml" in train.get("path", ""),
               train.get("head_branch") == "main",
               train.get("event") == "workflow_dispatch",
               train.get("status") == "completed",
               train.get("conclusion") == "success",
           ]):
-              raise SystemExit("Training run is not a successful main-branch train.yml run")
+              raise SystemExit("Training run is not a successful main-branch train.yaml run")
 
           sha = train["head_sha"]
           query = urllib.parse.urlencode({
