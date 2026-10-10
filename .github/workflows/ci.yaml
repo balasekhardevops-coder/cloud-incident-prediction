@@ -1,0 +1,325 @@
+
+name: Cloud Incident Prediction - DevSecOps CI
+
+on:
+  push:
+    branches: [main]
+
+  pull_request:
+    branches: [main]
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ==========================================
+  # JOB 1 - PYTEST + CODE QUALITY + SONARQUBE
+  # ==========================================
+  quality:
+    name: Tests and SonarQube Quality Gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-inference.txt
+          python -m pip install pytest pytest-cov httpx ruff
+
+      - name: Run Ruff linting
+        run: |
+          ruff check src tests
+
+      - name: Run pytest with coverage
+        run: |
+          python -m pytest tests/test_api.py -v \
+            --cov=src.api \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=80
+
+      # Secrets are not exposed to pull requests.
+      - name: Verify SonarQube token
+        if: github.event_name != 'pull_request'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "SONAR_TOKEN is missing"
+            exit 1
+          fi
+
+      - name: SonarQube Scan and Quality Gate
+        if: github.event_name != 'pull_request'
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.projectKey=balasekhardevops-coder
+            -Dsonar.organization=balasekhardevops-coder
+            -Dsonar.sources=src
+            -Dsonar.tests=tests
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+  # ==========================================
+  # JOB 2 - SAST USING SEMGREP
+  # ==========================================
+  sast:
+    name: Static Application Security Testing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install semgrep
+
+      - name: Run Semgrep SAST
+        run: |
+          semgrep scan \
+            --config p/python \
+            --error \
+            src tests
+
+  # ==========================================
+  # JOB 3 - SNYK SOFTWARE COMPOSITION ANALYSIS
+  # ==========================================
+  snyk_sca:
+    name: Snyk Dependency Security Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install -r requirements-inference.txt
+
+      - name: Setup Node.js
+        if: github.event_name != 'pull_request'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Snyk CLI
+        if: github.event_name != 'pull_request'
+        run: |
+          npm install --global snyk
+
+      - name: Scan dependencies - Critical threshold
+        if: github.event_name != 'pull_request'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "SNYK_TOKEN is missing"
+            exit 1
+          fi
+
+          snyk test \
+            --file=requirements-inference.txt \
+            --package-manager=pip \
+            --severity-threshold=critical
+
+  # ==========================================
+  # JOB 4 - DOCKER + SNYK CONTAINER + DAST
+  # ==========================================
+  docker:
+    name: Docker Build and Security Testing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [quality, sast, snyk_sca]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify model artifact
+        run: |
+          test -s models/incident_model.joblib
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t cloud-incident-api:ci .
+
+      - name: Setup Node.js for Snyk
+        if: github.event_name != 'pull_request'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Snyk CLI
+        if: github.event_name != 'pull_request'
+        run: |
+          npm install --global snyk
+
+      - name: Scan Docker image - Critical threshold
+        if: github.event_name != 'pull_request'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "SNYK_TOKEN is missing"
+            exit 1
+          fi
+
+          snyk container test cloud-incident-api:ci \
+            --file=Dockerfile \
+            --severity-threshold=critical
+
+      - name: Create Docker network
+        run: |
+          docker network create ci-network
+
+      - name: Start FastAPI container
+        run: |
+          docker run -d \
+            --name incident-api-ci \
+            --network ci-network \
+            -p 127.0.0.1:8000:8000 \
+            cloud-incident-api:ci
+
+      - name: Wait for healthy API
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              http://127.0.0.1:8000/health; then
+              echo "FastAPI is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs incident-api-ci
+          exit 1
+
+      - name: Test prediction endpoint
+        run: |
+          curl -fsS \
+            -X POST \
+            http://127.0.0.1:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{
+              "cpu_usage_pct": 85,
+              "memory_usage_pct": 90,
+              "error_rate_pct": 5.5,
+              "p95_latency_ms": 1800,
+              "pod_restarts": 3
+            }' \
+            | python3 -c '
+          import json, sys
+          result = json.load(sys.stdin)
+          assert result["prediction"] in (0, 1)
+          assert 0 <= result["incident_probability"] <= 1
+          assert result["prediction_window_minutes"] == 30
+          print(result)
+          '
+
+      # Passive DAST scan using OWASP ZAP
+      - name: Run OWASP ZAP Baseline
+        run: |
+          mkdir -p zap-reports
+          chmod 777 zap-reports
+
+          docker run --rm \
+            --network ci-network \
+            -v "${PWD}/zap-reports:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t http://incident-api-ci:8000/docs \
+            -m 1 \
+            -I \
+            -r zap-report.html \
+            -J zap-report.json
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-security-report
+          path: zap-reports/
+          if-no-files-found: ignore
+
+      - name: Show Docker logs and cleanup
+        if: always()
+        run: |
+          docker logs incident-api-ci || true
+          docker rm -f incident-api-ci || true
+          docker network rm ci-network || true
+
+  # ==========================================
+  # JOB 5 - FINAL MANDATORY SECURITY GATE
+  # ==========================================
+  security_gate:
+    name: Mandatory Security Gate
+    runs-on: ubuntu-24.04
+
+    needs:
+      - quality
+      - sast
+      - snyk_sca
+      - docker
+
+    if: ${{ always() && github.event_name != 'pull_request' }}
+
+    steps:
+      - name: Verify all required jobs passed
+        env:
+          QUALITY: ${{ needs.quality.result }}
+          SAST: ${{ needs.sast.result }}
+          SNYK: ${{ needs.snyk_sca.result }}
+          DOCKER: ${{ needs.docker.result }}
+        run: |
+          for result in "$QUALITY" "$SAST" "$SNYK" "$DOCKER"; do
+            if [ "$result" != "success" ]; then
+              echo "Security Gate FAILED"
+              echo "One or more required checks failed or were skipped."
+              exit 1
+            fi
+          done
+
+          echo "All security and quality gates PASSED"
+
+  
+  

@@ -1,0 +1,79 @@
+
+# ========================================
+# Python virtual environments
+# ========================================
+.venv/
+venv/
+env/
+
+# ========================================
+# Python cache and compiled files
+# ========================================
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ========================================
+# Testing and code quality
+# ========================================
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ========================================
+# VS Code / IDE
+# ========================================
+.vscode/
+.idea/
+
+# ========================================
+# Environment variables and secrets
+# ========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+
+# ========================================
+# MLflow tracking and artifacts
+# ========================================
+mlruns/
+mlartifacts/
+mlflow.db
+mlflow.db-*
+artifacts/
+
+# ========================================
+# Generated datasets
+# ========================================
+data/*.csv
+data/*.parquet
+
+# ========================================
+# Jupyter temporary files
+# ========================================
+.ipynb_checkpoints/
+
+# ========================================
+# Logs and temporary files
+# ========================================
+*.log
+*.tmp
+*.bak
+
+# ========================================
+# Operating system files
+# ========================================
+.DS_Store
+Thumbs.db
+
+# ========================================
+# Model files
+# ========================================
+# For this lab, keep the trained model in Git
+# because the Dockerfile copies this artifact.
+# models/incident_model.joblib
