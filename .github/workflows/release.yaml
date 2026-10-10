@@ -75,7 +75,7 @@ jobs:
               "status": "success",
               "per_page": 100,
           })
-          ci_runs = get(f"/actions/workflows/ci.yml/runs?{query}")["workflow_runs"]
+          ci_runs = get(f"/actions/workflows/ci.yaml/runs?{query}")["workflow_runs"]
           passed = False
           for ci in ci_runs:
               if ci.get("head_sha") != sha or ci.get("conclusion") != "success":
