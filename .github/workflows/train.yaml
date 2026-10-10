@@ -1,0 +1,173 @@
+name: Cloud Incident Prediction - Continuous Training
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train_candidate:
+    name: Train and validate candidate model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    env:
+      # Separate, temporary MLflow backend for this runner. No local PC server needed.
+      MLFLOW_TRACKING_URI: sqlite:///mlflow.db
+      MLFLOW_DISABLE_TELEMETRY: "true"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install inference and training dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-inference.txt
+          python -m pip install "mlflow==3.16.1" skops
+
+      - name: Generate a reproducible dataset
+        run: |
+          python data/generate_data.py
+          test -s data/telemetry.csv
+          sha256sum data/telemetry.csv
+
+      - name: Train classifiers and log experiments to MLflow
+        shell: bash
+        run: |
+          set -o pipefail
+          python -u src/train.py 2>&1 | tee training.log
+
+      - name: Enforce candidate acceptance criteria
+        env:
+          MIN_VALIDATION_F1: "0.80"
+          MIN_VALIDATION_RECALL: "0.80"
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          import mlflow
+          from mlflow.tracking import MlflowClient
+
+          mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+          experiment = mlflow.get_experiment_by_name(
+              "Cloud Infrastructure Incident Prediction"
+          )
+          if experiment is None:
+              raise SystemExit("FAIL: Expected MLflow experiment not found")
+
+          client = MlflowClient()
+          runs = client.search_runs(
+              experiment_ids=[experiment.experiment_id],
+              filter_string="tags.selected_model = 'true'",
+          )
+          selected = [run for run in runs if run.info.status == "FINISHED"]
+          if len(selected) != 1:
+              raise SystemExit(
+                  f"FAIL: Expected exactly one finished selected run, found {len(selected)}"
+              )
+
+          run = selected[0]
+          metrics = run.data.metrics
+          checks = {
+              "val_f1": float(os.environ["MIN_VALIDATION_F1"]),
+              "val_recall": float(os.environ["MIN_VALIDATION_RECALL"]),
+          }
+          for metric_name, minimum in checks.items():
+              actual = metrics.get(metric_name)
+              if actual is None or not (actual >= minimum):
+                  raise SystemExit(
+                      f"FAIL: {metric_name}={actual}, required >= {minimum}"
+                  )
+
+          for required_metric in ("test_f1", "test_recall", "test_precision"):
+              if required_metric not in metrics:
+                  raise SystemExit(f"FAIL: Selected run missing {required_metric}")
+
+          model_file = Path("models/incident_model.joblib")
+          dataset_file = Path("data/telemetry.csv")
+          for path in (model_file, dataset_file, Path("mlflow.db")):
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f"FAIL: Required artifact missing or empty: {path}")
+
+          summary = {
+              "decision": "candidate_accepted_for_review",
+              "deployment_status": "not_deployed",
+              "algorithm": run.data.params.get("algorithm"),
+              "run_id": run.info.run_id,
+              "experiment_id": experiment.experiment_id,
+              "validation": {
+                  "f1": metrics["val_f1"],
+                  "recall": metrics["val_recall"],
+                  "precision": metrics.get("val_precision"),
+                  "average_precision": metrics.get("val_average_precision"),
+              },
+              "test": {
+                  name.removeprefix("test_"): value
+                  for name, value in metrics.items()
+                  if name.startswith("test_")
+              },
+              "minimum_validation_f1": checks["val_f1"],
+              "minimum_validation_recall": checks["val_recall"],
+              "git_commit": os.environ["GITHUB_SHA"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "dataset_sha256": hashlib.sha256(dataset_file.read_bytes()).hexdigest(),
+              "model_sha256": hashlib.sha256(model_file.read_bytes()).hexdigest(),
+          }
+          # Make the exact code and dataset traceable from the MLflow run itself.
+          client.set_tag(run.info.run_id, "git_commit", summary["git_commit"])
+          client.set_tag(run.info.run_id, "dataset_sha256", summary["dataset_sha256"])
+
+          report_dir = Path("reports")
+          report_dir.mkdir(exist_ok=True)
+          (report_dir / "candidate_summary.json").write_text(
+              json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(summary, indent=2))
+
+          # Publish the essential result on the GitHub Actions run summary page.
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("## Training candidate accepted for manual review\n\n")
+              out.write(f"- Algorithm: **{summary['algorithm']}**\n")
+              out.write(f"- Validation F1: **{metrics['val_f1']:.3f}**\n")
+              out.write(f"- Validation recall: **{metrics['val_recall']:.3f}**\n")
+              out.write(f"- MLflow run ID: `{run.info.run_id}`\n")
+              out.write("- Deployment: **not performed**\n")
+          PY
+
+      - name: Upload candidate model and MLflow evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-model-candidate-${{ github.run_id }}
+          path: |
+            models/incident_model.joblib
+            reports/candidate_summary.json
+            data/telemetry.csv
+            training.log
+            mlflow.db
+            mlruns/
+            mlartifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostics if training fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-failure-logs-${{ github.run_id }}
+          path: |
+            training.log
+          if-no-files-found: ignore
+          retention-days: 7
