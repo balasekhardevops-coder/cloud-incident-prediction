@@ -1,0 +1,3 @@
+# Copy this file to terraform.tfvars and customize before applying.
+aws_region  = "ap-south-1"
+environment = "dev"

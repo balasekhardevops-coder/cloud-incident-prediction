@@ -1,0 +1,17 @@
+# Local Terraform cache and transient/secret-bearing artifacts
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+tfplan
+*.tfplan
+*.tfplan.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Keep .terraform.lock.hcl tracked after terraform init.
