@@ -1,0 +1,283 @@
+name: Cloud Incident Prediction - Model Release Approval
+
+on:
+  workflow_dispatch:
+    inputs:
+      training_run_id:
+        description: "Successful Continuous Training workflow run ID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: model-release-${{ inputs.training_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  verify_candidate:
+    name: Verify source training and DevSecOps CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.provenance.outputs.source_sha }}
+      model_sha: ${{ steps.artifact.outputs.model_sha }}
+
+    steps:
+      - name: Check successful training and matching CI/security gate
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.training_run_id }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["SOURCE_RUN_ID"]
+          if not run_id.isdecimal() or int(run_id) < 1:
+              raise SystemExit("Invalid training_run_id")
+          if os.environ["GITHUB_REF"] != "refs/heads/main":
+              raise SystemExit("Release workflow must run from main")
+
+          root = f"{os.environ['GITHUB_API_URL']}/repos/{repo}"
+          def get(path):
+              req = urllib.request.Request(
+                  root + path,
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "Accept": "application/vnd.github+json",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=25) as response:
+                  return json.load(response)
+
+          train = get(f"/actions/runs/{run_id}")
+          if not all([
+              ".github/workflows/train.yml" in train.get("path", ""),
+              train.get("head_branch") == "main",
+              train.get("event") == "workflow_dispatch",
+              train.get("status") == "completed",
+              train.get("conclusion") == "success",
+          ]):
+              raise SystemExit("Training run is not a successful main-branch train.yml run")
+
+          sha = train["head_sha"]
+          query = urllib.parse.urlencode({
+              "head_sha": sha,
+              "branch": "main",
+              "event": "push",
+              "status": "success",
+              "per_page": 100,
+          })
+          ci_runs = get(f"/actions/workflows/ci.yml/runs?{query}")["workflow_runs"]
+          passed = False
+          for ci in ci_runs:
+              if ci.get("head_sha") != sha or ci.get("conclusion") != "success":
+                  continue
+              jobs = get(f"/actions/runs/{ci['id']}/jobs?per_page=100")["jobs"]
+              # The final mandatory gate was called 'Mandatory Security Gate'
+              # in our DevSecOps CI workflow (possibly with a suffix).
+              if any(
+                  j.get("name", "").lower().startswith("mandatory security gate")
+                  and j.get("conclusion") == "success"
+                  for j in jobs
+              ):
+                  passed = True
+                  print(f"Verified CI/security gate: {ci['html_url']}")
+                  break
+
+          if not passed:
+              raise SystemExit("No successful DevSecOps CI security gate for training commit")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"source_sha={sha}\n")
+          print(f"Training run {run_id}: success; source commit: {sha}")
+          PY
+
+      - name: Download exact candidate artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: incident-model-candidate-${{ inputs.training_run_id }}
+          run-id: ${{ inputs.training_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: candidate
+
+      - name: Validate candidate manifest and artifact hashes
+        id: artifact
+        env:
+          SOURCE_SHA: ${{ steps.provenance.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ inputs.training_run_id }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("candidate")
+          report = root / "reports/candidate_summary.json"
+          model = root / "models/incident_model.joblib"
+          dataset = root / "data/telemetry.csv"
+          for path in (report, model, dataset):
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f"Missing or empty candidate file: {path}")
+          summary = json.loads(report.read_text(encoding="utf-8"))
+          if str(summary.get("github_run_id")) != os.environ["SOURCE_RUN_ID"]:
+              raise SystemExit("Training run ID does not match candidate")
+          if summary.get("git_commit") != os.environ["SOURCE_SHA"]:
+              raise SystemExit("Git SHA does not match candidate")
+          if summary.get("decision") != "candidate_accepted_for_review":
+              raise SystemExit("Candidate was not accepted by training gate")
+          if summary.get("deployment_status") != "not_deployed":
+              raise SystemExit("Unexpected deployment state")
+          if float(summary["validation"]["f1"]) < 0.80:
+              raise SystemExit("Candidate validation F1 below threshold")
+          if float(summary["validation"]["recall"]) < 0.80:
+              raise SystemExit("Candidate validation recall below threshold")
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          if sha256(model) != summary["model_sha256"]:
+              raise SystemExit("Model SHA-256 mismatch")
+          if sha256(dataset) != summary["dataset_sha256"]:
+              raise SystemExit("Dataset SHA-256 mismatch")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"model_sha={sha256(model)}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("## Candidate verified; pending human approval\n")
+              output.write(f"- Training run: `{os.environ['SOURCE_RUN_ID']}`\n")
+              output.write(f"- Source SHA: `{os.environ['SOURCE_SHA']}`\n")
+              output.write(f"- Algorithm: {summary['algorithm']}\n")
+              output.write(f"- F1: {summary['validation']['f1']:.3f}\n")
+              output.write(f"- Recall: {summary['validation']['recall']:.3f}\n")
+          print("Candidate model hashes and acceptance checks passed")
+          PY
+
+  approve_release:
+    name: Human review and approve candidate
+    needs: verify_candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: model-release
+
+    steps:
+      - name: Confirm an actual independent environment approval
+        id: reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN_ID: ${{ github.run_id }}
+          INITIATOR: ${{ github.actor }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          url = (
+              f"{os.environ['GITHUB_API_URL']}/repos/"
+              f"{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+              f"{os.environ['RELEASE_RUN_ID']}/approvals"
+          )
+          approved_by = None
+          for _ in range(5):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+              })
+              with urllib.request.urlopen(req, timeout=25) as response:
+                  reviews = json.load(response)
+              for entry in reviews:
+                  environment_names = [
+                      env.get("name") for env in entry.get("environments", [])
+                  ]
+                  username = entry.get("user", {}).get("login", "")
+                  if (entry.get("state", "").lower() == "approved"
+                      and "model-release" in environment_names
+                      and username
+                      and username.lower() != os.environ["INITIATOR"].lower()):
+                      approved_by = username
+                      break
+              if approved_by:
+                  break
+              time.sleep(2)
+
+          # Fail closed if the plan/environment has no reviewer protection.
+          if not approved_by:
+              raise SystemExit(
+                  "No independent GitHub Environment approval found. "
+                  "Configure required reviewers on model-release; "
+                  "this may require an eligible GitHub plan."
+              )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"approved_by={approved_by}\n")
+          print(f"Verified required environment reviewer: {approved_by}")
+          PY
+
+      - name: Download candidate from original training run
+        uses: actions/download-artifact@v4
+        with:
+          name: incident-model-candidate-${{ inputs.training_run_id }}
+          run-id: ${{ inputs.training_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: candidate
+
+      - name: Create approved release manifest
+        env:
+          MODEL_SHA: ${{ needs.verify_candidate.outputs.model_sha }}
+          SOURCE_SHA: ${{ needs.verify_candidate.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ inputs.training_run_id }}
+          REVIEWER: ${{ steps.reviewer.outputs.approved_by }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          model = Path("candidate/models/incident_model.joblib")
+          actual = hashlib.sha256(model.read_bytes()).hexdigest()
+          if actual != os.environ["MODEL_SHA"]:
+              raise SystemExit("Downloaded approved model digest does not match")
+          summary = json.loads(
+              Path("candidate/reports/candidate_summary.json").read_text(encoding="utf-8")
+          )
+          if (summary["git_commit"] != os.environ["SOURCE_SHA"]
+              or str(summary["github_run_id"]) != os.environ["SOURCE_RUN_ID"]):
+              raise SystemExit("Candidate provenance changed")
+          manifest = {
+              "status": "approved_for_future_release",
+              "deployment_status": "not_deployed",
+              "training_run_id": os.environ["SOURCE_RUN_ID"],
+              "source_git_sha": os.environ["SOURCE_SHA"],
+              "model_sha256": actual,
+              "approved_by": os.environ["REVIEWER"],
+              "approved_at_utc": datetime.now(timezone.utc).isoformat(),
+              "release_workflow_run_id": os.environ["GITHUB_RUN_ID"],
+          }
+          out = Path("approved")
+          out.mkdir(exist_ok=True)
+          (out / "release_manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Publish approved model as Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: approved-incident-model-${{ github.run_id }}
+          path: |
+            candidate/models/incident_model.joblib
+            candidate/reports/candidate_summary.json
+            approved/release_manifest.json
+          if-no-files-found: error
+          retention-days: 14
