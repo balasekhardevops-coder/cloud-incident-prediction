@@ -70,7 +70,7 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::758854589827:role/cloud-incident-prediction-github-deploy
+          role-to-assume: arn:aws:iam::758854589827:role/cloud-incident-prediction-dev-github-deploy
           aws-region: ap-south-1
       - name: Login to ECR
         id: login-ecr
