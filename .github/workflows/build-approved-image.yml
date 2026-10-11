@@ -1,0 +1,88 @@
+name: Build approved model image to ECR
+on:
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: Successful release.yaml run ID with approved artifact
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+concurrency:
+  group: approved-image-${{ inputs.release_run_id }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate main branch
+        run: test "$GITHUB_REF" = refs/heads/main
+      - name: Validate approved release run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          rid=os.environ['RELEASE_RUN_ID']
+          if not rid.isdecimal() or int(rid)<1: raise SystemExit('Invalid release run ID')
+          root=f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}"
+          req=urllib.request.Request(f'{root}/actions/runs/{rid}',headers={'Authorization':f"Bearer {os.environ['GH_TOKEN']}",'Accept':'application/vnd.github+json'})
+          with urllib.request.urlopen(req,timeout=25) as resp: run=json.load(resp)
+          if not (run['status']=='completed' and run['conclusion']=='success' and run['head_branch']=='main' and '.github/workflows/release.yaml' in run['path']):
+              raise SystemExit('Must use successful main-branch release.yaml workflow run')
+          PY
+      - name: Download approved model release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: approved-incident-model-${{ inputs.release_run_id }}
+          run-id: ${{ inputs.release_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: approved-release
+      - name: Validate model approval and replace Docker build artifact
+        env:
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        run: |
+          python - <<'PY'
+          import hashlib,json,os,pathlib,shutil
+          root=pathlib.Path('approved-release')
+          # Artifact paths from release.yaml are preserved on download.
+          model=root/'candidate/models/incident_model.joblib'
+          manifest=root/'approved/release_manifest.json'
+          if not manifest.is_file() or not model.is_file(): raise SystemExit('Missing approved release files')
+          obj=json.loads(manifest.read_text())
+          digest=hashlib.sha256(model.read_bytes()).hexdigest()
+          if not (obj.get('status')=='approved_for_future_release' and
+                  obj.get('deployment_status')=='not_deployed' and
+                  str(obj.get('release_workflow_run_id'))==os.environ['RELEASE_RUN_ID'] and
+                  obj.get('model_sha256')==digest):
+              raise SystemExit('Approved release provenance/hash mismatch')
+          shutil.copyfile(model,'models/incident_model.joblib')
+          print('Approved model staged for Docker image:',digest)
+          PY
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::758854589827:role/cloud-incident-prediction-github-deploy
+          aws-region: ap-south-1
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push approved image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO: cloud-incident-prediction-dev
+          RELEASE_RUN: ${{ inputs.release_run_id }}
+        run: |
+          IMAGE="$REGISTRY/$REPO:release-${RELEASE_RUN}-${GITHUB_SHA}"
+          docker build --pull -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE_URI=$IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo 'Use this immutable image URI in scripts/deploy-local.sh' >> "$GITHUB_STEP_SUMMARY"

@@ -1,3 +1,5 @@
+> **State backend correction (2026-10-10):** Before running `terraform init` or `terraform apply`, complete `infra/terraform/BACKEND_SETUP.md` to bootstrap the dedicated state bucket and migrate any existing local state. Terraform >= 1.10 is required.
+
 # Task 12: AWS S3 and ECR using Terraform
 
 This directory provisions one private, versioned S3 bucket for ML data/model
@@ -5,7 +7,7 @@ artifacts and one private ECR repository for FastAPI/Docker images.
 
 ## Prerequisites
 
-- Terraform >= 1.5; AWS CLI v2; Git; AWS permissions to create S3 and ECR resources.
+- Terraform >= 1.10; AWS CLI v2; Git; AWS permissions to create S3 and ECR resources.
 - Prefer AWS IAM Identity Center (SSO) instead of long-lived access keys.
 - Apply from VS Code's **Git Bash** terminal on Windows or a Unix shell.
 
@@ -28,7 +30,7 @@ cd infra/terraform
 cp terraform.tfvars.example terraform.tfvars
 # Edit terraform.tfvars for the target Region and environment.
 terraform version
-terraform init
+terraform init -migrate-state -backend-config=backend.hcl
 terraform fmt -recursive
 terraform validate
 terraform plan -out=tfplan
@@ -80,10 +82,10 @@ This file upload is optional and requires S3 PutObject permission.
 
 ## State and cost safety
 
-- This introductory lab uses **local Terraform state**, not an S3 backend.
+- This lab uses a **dedicated S3 remote backend with native lockfile locking**. Follow `BACKEND_SETUP.md`.
 - Never commit or share `terraform.tfstate` or saved plan files; they can contain
   sensitive metadata. Back up state securely, avoid concurrent applies, and
-  migrate to a separately bootstrapped remote backend before team/CI use.
+  grant scoped remote backend IAM permissions before team/CI use.
 - S3 versioning incurs storage charges for older versions. ECR images also cost
   storage; the lifecycle policy expires images beyond the latest 30.
 - S3 bucket uses `force_destroy = false`; ECR uses `force_delete = false` to

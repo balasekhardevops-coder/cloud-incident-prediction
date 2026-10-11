@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: incident-api
+  namespace: incident-prediction
+spec:
+  type: ClusterIP
+  selector:
+    app: incident-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

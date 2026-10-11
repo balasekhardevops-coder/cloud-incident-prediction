@@ -1,0 +1,9 @@
+# APPEND these to the existing infra/terraform/terraform.tfvars file.
+# Replace 203.0.113.10 with the public IPv4 returned by `curl -s https://checkip.amazonaws.com`.
+# NEVER use 0.0.0.0/0 for the Kubernetes API allowlist.
+
+vpc_cidr                  = "10.20.0.0/16"
+eks_kubernetes_version    = "1.36"
+eks_public_access_cidrs   = ["59.88.211.122/32"]
+eks_node_instance_types   = ["t3.medium"]
+eks_node_desired_size     = 2

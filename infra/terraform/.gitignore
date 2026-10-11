@@ -15,3 +15,11 @@ override.tf.json
 *_override.tf.json
 
 # Keep .terraform.lock.hcl tracked after terraform init.
+# Remote backend environment selection (do not commit local configuration)
+backend.hcl
+backend.*.hcl
+!backend.hcl.example
+
+# State backups, including pre-migration backups
+*.tfstate.backup*
+state-backup*/

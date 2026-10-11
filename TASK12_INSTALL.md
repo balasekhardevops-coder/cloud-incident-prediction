@@ -1,3 +1,5 @@
+> **State backend correction (2026-10-10):** Before running `terraform init` or `terraform apply`, complete `infra/terraform/BACKEND_SETUP.md` to bootstrap the dedicated state bucket and migrate any existing local state. Terraform >= 1.10 is required.
+
 # Add Task 12 files to your existing clone
 
 Extract this ZIP into the **repository root** of
